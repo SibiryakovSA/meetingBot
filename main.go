@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v4"
@@ -21,11 +23,19 @@ type TelegramRecieved struct {
 
 // Message ...
 type Message struct {
+	MessageID      int            `json:"message_id"`
 	Chat           Chat         `json:"chat"`
 	Text           string       `json:"text"`
 	From           ChatMember   `json:"from"`
+	ReplyToMessage ReplyToMessage `json:"reply_to_message"`
 	NewChatMembers []ChatMember `json:"new_chat_members"`
 	LeftChatMember ChatMember   `json:"left_chat_member"`
+}
+
+// Message Response...
+type MessageResponse struct {
+	Ok     bool   `json:"ok"`
+	Result Message `json:"result"`
 }
 
 // MessageEntity ...
@@ -50,10 +60,24 @@ type ChatMember struct {
 	IsBot     bool   `json:"is_bot"`
 }
 
+type ReplyToMessage struct {
+	MessageID int        `json:"message_id"`
+}
+
 // ForceReply ...
 type ForceReply struct {
 	ForceReply bool `json:"force_reply"`
 	Selective  bool `json:"selective"`
+}
+
+type ReplyKeyboardMarkup struct {
+	Keyboard [][]KeyboardButton `json:"keyboard"`
+	ResizeKeyboard bool `json:"resize_keyboard"`
+	OneTimeKeyboard bool `json:"one_time_keyboard"`
+	Selective  bool `json:"selective"`
+}
+type KeyboardButton struct {
+	Text string `json:"text"`
 }
 
 type meeting struct {
@@ -61,15 +85,27 @@ type meeting struct {
 	start   time.Time
 	finish  time.Time
 	answers []memberAnswer
-	stats   []int
+	timeIntervals [2][3]timeInterval
 }
 type memberAnswer struct {
 	telegramID int
 	firstName  string
+	waitingReplyToMessageID int
 	answered   bool
-	answer1    time.Time
-	answer2    time.Time
+	asked   time.Time
+	rounds [2]memberAnswerRound
 }
+
+type memberAnswerRound struct {
+	exactTime time.Time
+	selectedInterval int
+}
+
+type timeInterval struct {
+	start time.Time
+	finish time.Time
+}
+
 
 func substr(input string, start int, length int) string {
 	asRunes := []rune(input)
@@ -84,13 +120,34 @@ func substr(input string, start int, length int) string {
 
 	return string(asRunes[start : start+length])
 }
+func parseTime(text string) (time.Time, error){
+	var parsedValue time.Time
 
+	text = strings.TrimSpace(text)
+
+	parsedValue, err := time.Parse("15", text)
+	if err == nil{
+		return parsedValue, nil
+	}
+	parsedValue, err = time.Parse("15:04", text)
+	if err == nil{
+		return parsedValue, nil
+	}
+	parsedValue, err = time.Parse("15.04", text)
+	if err == nil{
+		return parsedValue, nil
+	}
+	return parsedValue, errors.New("parse failed")
+}
 func doSomethingWithError(err error) {
 	fmt.Println("error occured")
 	fmt.Println(err)
 }
+///////////////////////////////////////////////////////////////////////////////
 
 func newChatMember(input *TelegramRecieved) {
+
+	fmt.Println("newChatMember")
 	//подключаюсь к базе данных
 	conn, err := pgx.Connect(context.Background(), connString)
 	if err != nil {
@@ -126,9 +183,150 @@ func leftChatMember(input *TelegramRecieved) {
 	}
 }
 
-func getMeetingStat(input *TelegramRecieved, meeting *meeting, messageWaitngFromID *int, start bool) {
+func delayedMeetingStat(meeting *meeting){
+
+	time.Sleep(1 * time.Minute)
+
+	var lastAsked time.Time
+	lastAskedIndex := -1
+	for i := 0; i < len(meeting.answers); i++ {
+		if meeting.answers[i].asked.After(lastAsked){
+			lastAsked = meeting.answers[i].asked
+			lastAskedIndex = i
+		}
+	}
+	if lastAskedIndex == (len(meeting.answers) -1) {
+		go delayedMeetingStat(meeting)
+		return
+	}
+	if lastAsked.Add(time.Minute).Before(time.Now()){
+		// бахнуть новое сообщение
+		sendAskMeetingTimeMessage(meeting)
+		go delayedMeetingStat(meeting)
+	}
+	go delayedMeetingStat(meeting)
+}
+////////////////////////////////////////////////////////////////////////
+
+
+func getTimeInterval(meeting *meeting) [3]timeInterval{
+	start := meeting.start
+	finish := meeting.finish
+
+	var res [3]timeInterval
+	delta := finish.Sub(start)
+	delta = delta / 3
+
+	res[0].start = start
+	res[0].finish = res[0].start.Add(delta)
+	res[1].start = res[0].finish
+	res[1].finish = res[1].start.Add(delta)
+	res[2].start = res[1].finish
+	res[2].finish = finish
+	return res
+}
+func getReplyKeyboard(meeting *meeting) []byte{
+	var keyboard ReplyKeyboardMarkup
+	keyboard.Selective = true
+	keyboard.OneTimeKeyboard = false
+	keyboard.ResizeKeyboard = true
+
+	keyboard.Keyboard = make([][]KeyboardButton, 0, 1)
+	keyboard.Keyboard = append(keyboard.Keyboard, []KeyboardButton{})
+	keyboard.Keyboard[0] = make([]KeyboardButton, 0, 4)
+
+	for _, value := range getTimeInterval(meeting) {
+		var button KeyboardButton
+		button.Text=fmt.Sprintf("%s - %s", value.start.Format("15:04"), value.finish.Format("15:04"))
+		keyboard.Keyboard[0] = append(keyboard.Keyboard[0], button)
+	}
+
+	kbJSON, _ := json.Marshal(keyboard)
+	return kbJSON
+}
+
+func parseUserReply(reply string, curIndex int, meeting *meeting) (bool, time.Time, time.Time, error){
+	var firstTime time.Time
+	var lastTime time.Time
+	reply = strings.TrimSpace(reply)
+	reply = strings.ToLower(reply)
+	firstDivider := strings.Index(reply, ":")
+	lastDivider := strings.LastIndex(reply, ":")
+
+
+	fmt.Println("reply is ", reply)
+	fmt.Println("firstDivider ", firstDivider)
+	fmt.Println("lastDivier ", lastDivider)
+
+
+	if firstDivider == -1{
+		//if strings.Contains(reply, "нет"){
+		//	return true, firstTime, lastTime, nil
+		//} else{
+		//	return false, firstTime, lastTime, errors.New("parse failed")
+		//}
+		return false, firstTime, lastTime, errors.New("parse failed")
+	}
+	if firstDivider == lastDivider {
+		firstTime, err := parseTime(string([]rune(reply)[firstDivider-2:firstDivider+3]))
+		if err != nil{
+			return false, firstTime, lastTime, errors.New("parse failed")
+		}
+		return false, firstTime, lastTime, nil
+	}
+
+	firstTime, err := parseTime(string([]rune(reply)[firstDivider-2:firstDivider+3]))
+	if err != nil{
+		return false, firstTime, lastTime, errors.New("parse failed")
+	}
+	lastTime, err = parseTime(string([]rune(reply)[lastDivider-2:lastDivider+3]))
+	if err != nil{
+		return false, firstTime, lastTime, errors.New("parse failed")
+	}
+	return true, firstTime, lastTime, nil
+}
+
+
+
+
+
+func sendAskMeetingTimeMessage(meeting *meeting){
+	kbJSON := getReplyKeyboard(meeting)
+
+	for i := 0; i < len(meeting.answers); i++ {
+		if !meeting.answers[i].answered {
+			if meeting.answers[i].waitingReplyToMessageID != 0 {
+				continue
+			}
+			resp, err := http.PostForm(sendMessageURL,
+				url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {getNewMeetingAskTimeMessage(meeting.answers[i].telegramID, meeting.title, meeting.answers[i].firstName, meeting.start, meeting.finish)}, "reply_markup": {string(kbJSON)}, "parse_mode": {"MarkdownV2"}})
+			if err != nil {
+				doSomethingWithError(err)
+				return
+			}
+
+			//читаю тело запроса
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				doSomethingWithError(err)
+				return
+			}
+			var respMessage MessageResponse
+			err = json.Unmarshal(body, &respMessage)
+			if err != nil {
+				doSomethingWithError(err)
+				return
+			}
+			meeting.answers[i].waitingReplyToMessageID = respMessage.Result.MessageID
+			meeting.answers[i].asked = time.Now()
+			return
+		}
+	}
+
+	fmt.Println("first round finished")
+}
+func getMeetingStat(input *TelegramRecieved, meeting *meeting, start bool) {
 	if start {
-		*messageWaitngFromID = 0
 		conn, err := pgx.Connect(context.Background(), connString)
 		if err != nil {
 			return
@@ -140,59 +338,143 @@ func getMeetingStat(input *TelegramRecieved, meeting *meeting, messageWaitngFrom
 		if err != nil {
 			return
 		}
+		meeting.answers = make([]memberAnswer, 0, 20)
 		for rows.Next() {
-			meeting.answers = make([]memberAnswer, 0, 20)
 			var answer memberAnswer
-
 			rows.Scan(&answer.telegramID, &answer.firstName)
 			meeting.answers = append(meeting.answers, answer)
 		}
-	}
+	} else {
+		curIndex := -1
+		//
+		// проверяю, ожидаю ли ответа от такого человека вообще, был ли он в бд
+		for index, el := range meeting.answers{
+			if el.waitingReplyToMessageID == input.Message.ReplyToMessage.MessageID {
+				curIndex = index
+			}
+		}
+		//
+		// проверяю ответил на сообщение тот человек, для которого предназначалось сообщение или кто-то чужой
+		if curIndex == -1 || meeting.answers[curIndex].telegramID != input.Message.From.ID{
+			return
+		}
 
-	for i := 0; i < len(meeting.answers); i++ {
-		if !meeting.answers[i].answered {
-
+		interval := false
+		var start, finish time.Time
+		interval, start, finish, err := parseUserReply(input.Message.Text, curIndex, meeting)
+		if err != nil{
+			//
+			//если не удалось распознать сообщение от человека, отправляю сообщение еще раз
 			var fr ForceReply
 			fr.ForceReply = true
 			fr.Selective = true
-			frJSON, _ := json.Marshal(fr)
+			var frJSON []byte
+			frJSON, _ = json.Marshal(fr)
 
-			resp, err := http.PostForm(sendMessageURL,
-				url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {getNewMeetingAskTimeMessage(meeting.answers[i].telegramID, meeting.title, meeting.answers[i].firstName, meeting.start, meeting.finish)}, "reply_markup": {string(frJSON)}, "parse_mode": {"MarkdownV2"}})
+			resp , err := http.PostForm(sendMessageURL,
+				url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {notRecognizedMessageError(input.Message.From.ID, input.Message.From.FirstName)}, "reply_markup": {string(frJSON)}, "parse_mode": {"MarkdownV2"}})
 			if err != nil {
 				doSomethingWithError(err)
 				return
 			}
-			fmt.Println(resp)
+
+			//читаю тело запроса
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				doSomethingWithError(err)
+				return
+			}
+			var respMessage MessageResponse
+			err = json.Unmarshal(body, &respMessage)
+			if err != nil {
+				doSomethingWithError(err)
+				return
+			}
+			meeting.answers[curIndex].waitingReplyToMessageID = respMessage.Result.MessageID
+			return
+		}
+		meeting.answers[curIndex].answered = true
+		meeting.answers[curIndex].waitingReplyToMessageID = -1
+		if !interval {
+			meeting.answers[curIndex].rounds[0].exactTime = start
+		} else{
+			if finish.Before(meeting.timeIntervals[0][0].finish){
+				meeting.answers[curIndex].rounds[0].selectedInterval = 0
+			} else if start.After(meeting.timeIntervals[0][1].finish) {
+				meeting.answers[curIndex].rounds[0].selectedInterval = 2
+			} else {
+				meeting.answers[curIndex].rounds[0].selectedInterval = 1
+			}
+		}
+
+		var fr ForceReply
+		fr.ForceReply = false
+		fr.Selective = true
+		var frJSON []byte
+		frJSON, _ = json.Marshal(fr)
+
+		_, err = http.PostForm(sendMessageURL,
+			url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {answerAccepted(input.Message.From.ID, input.Message.From.FirstName)}, "reply_markup": {string(frJSON)}, "parse_mode": {"MarkdownV2"}})
+		if err != nil {
+			doSomethingWithError(err)
+			return
 		}
 	}
+	sendAskMeetingTimeMessage(meeting)
 }
 
+
 func newCommandCame(input *TelegramRecieved, meeting *meeting, messageWaitngFromID *int, state *int, askTimeCreateState *bool) {
-
-	fmt.Printf("messageIdWaitFrom = %d \n", *messageWaitngFromID)
-
-	if input.Message.From.ID == *messageWaitngFromID {
-		if *state == 1 {
+	if *state == 1  {
+		if input.Message.From.ID == *messageWaitngFromID {
 			if *askTimeCreateState {
-
-				*askTimeCreateState = false
-				*state = 2
-				*messageWaitngFromID = 0
+				//
+				//обработка ответа о времени при создании встречи
+				var fr ForceReply
+				fr.ForceReply = true
+				frJSON, _ := json.Marshal(fr)
 
 				var tempTime time.Time
-				tempTime, err := time.Parse("15:04", substr(input.Message.Text, 0, 5))
+				input.Message.Text = input.Message.Text + " "
+				tempTime, err := parseTime(substr(input.Message.Text, 0, strings.Index(input.Message.Text, " ")))
 				if err != nil {
-					doSomethingWithError(err)
+					_, err := http.PostForm(sendMessageURL,
+						url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {notRecognizedMessageError(input.Message.From.ID, input.Message.From.FirstName)}, "reply_markup": {string(frJSON)}, "parse_mode": {"MarkdownV2"}})
+					if err != nil {
+						doSomethingWithError(err)
+						return
+					}
+					return
 				}
 				meeting.start = tempTime
 
-				tempTime, err = time.Parse("15:04", substr(input.Message.Text, 6, 5))
+				tempTime, err = parseTime(substr(input.Message.Text, strings.Index(input.Message.Text, " "), len(input.Message.Text)))
 				if err != nil {
-					doSomethingWithError(err)
+					_, err := http.PostForm(sendMessageURL,
+						url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {notRecognizedMessageError(input.Message.From.ID, input.Message.From.FirstName)}, "reply_markup": {string(frJSON)}, "parse_mode": {"MarkdownV2"}})
+					if err != nil {
+						doSomethingWithError(err)
+						return
+					}
+					return
 				}
 				meeting.finish = tempTime
-				fmt.Println(meeting.start, meeting.finish)
+				if meeting.finish.Before(meeting.start) || meeting.start.Equal(meeting.finish) {
+					_, err := http.PostForm(sendMessageURL,
+						url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {notRecognizedMessageError(input.Message.From.ID, input.Message.From.FirstName)}, "reply_markup": {string(frJSON)}, "parse_mode": {"MarkdownV2"}})
+					if err != nil {
+						doSomethingWithError(err)
+						return
+					}
+					return
+				}
+				*askTimeCreateState = false
+				*state = 2
+				*messageWaitngFromID = 0
+				meeting.timeIntervals[0] = getTimeInterval(meeting)
+
+				fmt.Println("Event will be between", meeting.start, meeting.finish)
+
 
 				_, err = http.PostForm(sendMessageURL,
 					url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {"Отлично, событие " + meeting.title + " создано"}})
@@ -200,8 +482,10 @@ func newCommandCame(input *TelegramRecieved, meeting *meeting, messageWaitngFrom
 					doSomethingWithError(err)
 					return
 				}
-				getMeetingStat(input, meeting, messageWaitngFromID, true)
+				getMeetingStat(input, meeting, true)
 			} else {
+				//
+				//отправка вопроса о времени проведения нового мероприятия
 				*askTimeCreateState = true
 				meeting.title = input.Message.Text
 
@@ -210,21 +494,20 @@ func newCommandCame(input *TelegramRecieved, meeting *meeting, messageWaitngFrom
 				frJSON, _ := json.Marshal(fr)
 
 				_, err := http.PostForm(sendMessageURL,
-					url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {newMeetingAskTimeRangeMessage(input.Message.From.ID, input.Message.From.FirstName)}, "reply_markup": {string(frJSON)}})
+					url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {newMeetingAskTimeRangeMessage(input.Message.From.ID, input.Message.From.FirstName)}, "reply_markup": {string(frJSON)}, "parse_mode": {"MarkdownV2"}})
 				if err != nil {
 					doSomethingWithError(err)
 					return
 				}
 			}
-		} else if *state == 2 {
-			getMeetingStat(input, meeting, messageWaitngFromID, false)
 		}
+	} else if *state == 2 {
+		getMeetingStat(input, meeting, false)
 	}
 
 	if input.Message.Text == "/newmeeting" {
 		meeting.title = ""
 		meeting.answers = []memberAnswer{}
-		meeting.stats = []int{}
 
 		*state = 1
 		*askTimeCreateState = false
@@ -233,15 +516,15 @@ func newCommandCame(input *TelegramRecieved, meeting *meeting, messageWaitngFrom
 		var fr ForceReply
 		fr.ForceReply = true
 		fr.Selective = true
-		frJSON, err := json.Marshal(fr)
+		frJSON, _ := json.Marshal(fr)
 
-		resp, err := http.PostForm(sendMessageURL,
-			url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {newMeetingMessage(input.Message.From.ID, input.Message.From.FirstName)}, "reply_markup": {string(frJSON)}})
+
+		_, err := http.PostForm(sendMessageURL,
+			url.Values{"chat_id": {strconv.Itoa(telegramChatID)}, "text": {newMeetingMessage(input.Message.From.ID, input.Message.From.FirstName)}, "reply_markup": {string(frJSON)}, "parse_mode": {"MarkdownV2"}})
 		if err != nil {
 			doSomethingWithError(err)
 			return
 		}
-		fmt.Println(resp)
 	}
 }
 func main() {
@@ -268,7 +551,7 @@ func main() {
 			return
 		}
 
-		fmt.Println(string(body))
+
 		if len(input.Message.NewChatMembers) != 0 {
 			newChatMember(&input)
 		} else if input.Message.LeftChatMember.ID != 0 {
@@ -277,6 +560,8 @@ func main() {
 			newCommandCame(&input, &meeting1, &messageWaitngFromID, &state, &askTimeCreateState)
 		}
 	})
+
+	go delayedMeetingStat(&meeting1)
 
 	fmt.Println("Server is listening...")
 	http.ListenAndServe("localhost:8182", nil)
